@@ -1,0 +1,12 @@
+name: May_report
+title: May_report
+username:
+account: uqzyin2
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 351601
+bundleId: 1404734
+url: https://uqzyin2.shinyapps.io/May_report/
+when: 1527843871.23934
+asMultiple: FALSE
+asStatic: FALSE

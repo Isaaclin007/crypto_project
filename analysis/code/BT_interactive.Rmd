@@ -1,0 +1,95 @@
+---
+title: "Backtesting"
+output:
+  html_document:
+    df_print: paged
+runtime: shiny
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r load dt balance data, include=FALSE}
+rm(list=ls())
+library(readr)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(Hmisc)
+library(tidyverse)
+library(lubridate)
+library(data.table)
+library(ecm)
+library(urca)
+library(vars)
+library(plyr) 
+library(readr)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(Hmisc)
+library(tidyverse)
+library(lubridate)
+library(plyr)
+library(urca)
+library(TTR)
+library(xts)
+
+```
+
+Graph
+```{r, echo = FALSE}
+library(shiny)
+sliderInput("threshold", "Amount:", min = 0, max = 4, value = 2,step = 0.1)
+y <- readRDS("dt.rds")
+lookback =16
+
+renderPlot({
+
+
+total = y %>% 
+  mutate(excute = ifelse(abs(mktVal)>input$threshold,  mktVal, 0),
+         et.xbidyask = dt.sell.y - beta_ols*dt.sell.x , #notice buy.y > last.y > sell.y
+         et.ybidxask = dt.buy.y - beta_ols*dt.buy.x, #notice sell.x > last.x > buy.x
+         et.ahead = lead(et,lookback),
+         et.real = ifelse(et<0, et.ybidxask, et.xbidyask), # if et<0, we should buy y sell 1.02x
+         et.real_ahead = lead(et.real,lookback), # hold the asset after 17 periods
+         et.real.reverse = ifelse(et>0, et.ybidxask, et.xbidyask),
+         et.real_ahead_reverse = lead(et.real.reverse,lookback),
+         profit_close = excute*(et.ahead - et),
+         profit_close_fee = excute*(et.ahead - et)  - abs(excute)*dt.last.x * 0.0025,
+         profit_bidask = excute*(et.real - et.real_ahead),
+         profit_bidask_fee = excute*(et.real - et.real_ahead)  - abs(excute)*dt.last.x * 0.0025,
+         cum_profit_close = cumsum(ifelse(is.na(profit_close), 0, profit_close)),
+         cum_profit_fee = cumsum(ifelse(is.na(profit_close_fee), 0, profit_close_fee)),
+         cum_profit_bidask_fee = cumsum(ifelse(is.na(profit_bidask_fee), 0, profit_bidask_fee)),
+         cum_profit_bidask = cumsum(ifelse(is.na(profit_bidask), 0, profit_bidask)),
+         time = ymd_hm(dt.utc)
+  )
+
+ggplot(data = total) +
+  geom_line(aes(x=time,y=cum_profit_bidask))
+
+})
+```
+
+
+
+
+
+
+
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+plot(cars)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
