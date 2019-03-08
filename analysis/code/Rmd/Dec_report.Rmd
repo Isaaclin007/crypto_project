@@ -1,0 +1,1193 @@
+---
+title: "December Report"
+author: "Zi Yin"
+date: "30/12/2018"
+output:
+  html_document:
+    toc: true # table of content true
+    toc_depth: 3  # upto three depths of headings (specified by #, ## and ###)
+    number_sections: true  ## if you want number sections at each table header
+    theme: united  # many options for theme, this one is my favorite.
+    highlight: tango  # specifies the syntax highlighting style
+  html_notebook: 
+    toc: yes
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r load dt balance data, include=FALSE}
+rm(list=ls())
+library(readr)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(Hmisc)
+library(tidyverse)
+library(lubridate)
+library(data.table)
+library(ecm)
+library(urca)
+library(vars)
+library(plyr) 
+
+dt <- readRDS("dt.rds")
+
+dt = dt %>% 
+  filter(time > '2018-12-02 12:52:08') 
+
+dt_row = dt %>% 
+  filter(time > '2018-12-02 12:52:08')
+
+
+
+calprofit = function(x){
+  log(x/lag(x,1))
+}
+
+dt = data.table(dt)
+profit= dt[,calprofit(bal_total),by=exchange]
+profit = profit[,2]
+
+stdbal = dt[,bal_total,by=exchange]
+halfbaleth = stdbal$bal_total[1]/(2*dt$market_price[1])
+halfbalfiat = stdbal$bal_total[1]/2
+stdbal$bal_total= halfbalfiat + halfbaleth*dt$market_price
+
+
+dtprofit = data.table(stdbal)
+profitbal = stdbal[,calprofit(bal_total),by=exchange]
+profitbal = profitbal[,2]
+
+dt = cbind(dt,profit,profitbal)
+colnames(dt)[17] <- "profit"
+colnames(dt)[18] <- "profit_fiftypercent"
+
+cum_profit = dt[,cumsum(ifelse(is.na(profit), 0, profit)),by = exchange]
+cum_profit = cum_profit[,2]
+dt = cbind(dt,cum_profit)
+colnames(dt)[19] <- "cum_profit"
+
+cum_profit_fiftypercent = dt[,cumsum(ifelse(is.na(profit_fiftypercent), 0, profit_fiftypercent)),by = exchange]
+cum_profit_fiftypercent = cum_profit_fiftypercent[,2]
+dt = cbind(dt,cum_profit_fiftypercent)
+colnames(dt)[20] <- "cum_profit_fiftypercent"
+
+
+dt = mutate(dt,
+       dif_nd = arb_now - arb_day,
+       dif_nh = arb_now - arb_hour,
+       dif_dm = arb_day - arb_month,
+       dif_nw = arb_day - arb_week,
+       dif_hw = arb_hour - arb_week,
+       bas = market_ask/market_bid)
+
+quoinex_total = dt %>% 
+  filter(exchange == 'quoinex')
+quoinex_total=quoinex_total[, c("time",'market_price')]
+
+total = dt %>%
+  filter(exchange == 'total')
+
+
+total = total %>% 
+  mutate(tb_filter = bal_total - 40*market_price,
+         profit_filter = calprofit(tb_filter),
+         cum_profit_filter =cumsum(ifelse(is.na(profit_filter), 0, profit_filter)) )
+
+
+
+```
+```{r load dt_trans and gb data, include=FALSE}
+dt_trans <- readRDS("dt_trans.rds")
+global_vol = readRDS("dt_gv.rds")
+
+# dt_trans <- readRDS("dt_trans.rds")
+# global_vol = readRDS("dt_gv.rds")
+
+# select transaction data (livecoin record the deposite and withdraw)
+dt_trans = dt_trans %>% 
+  filter(price>0) %>% 
+  filter(time > '2018-11-01 12:52:08')
+
+```
+```{r merge dt_trans and dt data in order to do realization test, include=FALSE}
+dt_trans <- readRDS("dt_trans.rds")
+global_vol = readRDS("dt_gv.rds")
+
+
+# dt_trans <- readRDS("dt_trans.rds")
+# global_vol = readRDS("dt_gv.rds")
+
+# select transaction data (livecoin record the deposite and withdraw)
+dt_trans = dt_trans %>% 
+  filter(price>0) %>% 
+  filter(time > '2018-11-01 12:52:08')
+
+```
+
+# Introduction
+
+This report aims to improve the performances of various traders in different exchanges based on the data fetched from our private traders and public exchanges.
+
+## Strategy Summary  
+
+The trader is continuously bidding and asking based on two different strategies: MA and BAS. 
+
+The BAS strategy (also called scalping) determins the 'market maker (limit order)' nature of the trader, where the advanatages are 1) transaction fee is lower 2) profit gaining on the spread and 3) relative better price compared to market takers. The disadvantages are 1) take more time to be filled 2) less profitbale when there are more 'smarter traders' in the exchange. For example, when the smart trader correctly predict the upward trend, they will fill our ask (as a taker) hence we will lose the potential gain. **The BAS strategy works best in a price stable (low volatile), 'average smart', high BAS and high volume market.** And most important, the trader should be super fast to cancel the previous order and update a new one based on the newest order book to make sure we are competitive but not cheap. The common scalping implementation can be simply bid/ask the price of the second (3rd or whatever) most competitive in the order book, which is called balanced scalping in a sence that bid and ask are treat equally. However, in cryptocurrency market, as it is very volatile, we may want to use unbalanced scalping (or called "skew"). For example, if we predict next 5 mins the price will decline, we may have more competitive ask price (say 2nd of orderbook) but less competitive bid price (10th of orderbook). 
+
+The way we predict the future price is using MA strategy. If MA_now - MA_day > 0, we will have more competitive ask (as we expect the price will decline to the long trend, which is MA_day) but less competitive bid. 
+
+The combination of these two strategies could 1) make scalping profit when the difference of MA of short and long run is small, which means we are in stable market 2) Avoid potential huge risk and are able to ride the upward trend when the difference is salient, which means in volatile market. All in all, we are using MA to determine if the upcoming market is volatile or stable by looking at the difference between MA_now and MA_day, if it's stable, BAS will work, if it's unstable, MA will work. There are only two things need to be determined afterwards: price and volume. 
+
+## Model specification
+
+Let's first specify the base model in order to determine the price and size of the trader's bid/ask in every second (take bid as example): 
+
+$$bid_{size} = bal_{fiat} * 0.2$$ 
+
+$$bid_{price} = (MA_{day}/MA_{now})*bid_{10th}*g(x)$$
+
+Notice here we use the 10th bidder in the order book as a reference point, and every trades will take the 20% of the fiat balance. For example, if MA_now < MA_day, we should buy crypto, so we surpass the 10th bidder and bid higher with the intention to buy crypto. 
+
+Second, we change the MA in the local exchange price in the above base model to a ratio of price in leader market and local market, where we make the assumption there is a lead-lag relationship between small and big exchanges. At the moment, the function g(x) is just a constant = 1, however from (3) - (6), we will expand our base model by adding more variables into g(x).
+
+Third, in order to keep high trading volume we have to ensure both fiat and crypto have enough balance, so we add target local balance (0.5) required profit level, this parameter is in a range of (0 - 0.005), a function of local balance. e.g., if we have very low fiat bal, even though we should still bid according to scalping trategy,  we don't want to be too competitive in the bid market, so the required profit is higher. 
+
+Fourth, for the same reasoning we add the target global balance (0.45) required profit level (0 - 0.02). It is four time bigger than local balance, which may influence a lot for the determination of price. 
+
+Fifth, we add the exchange transcation fee and expected profit margin (0.0005) for each trade.
+
+Lastly, we add the additional profit level which is a function of MA_day - MA_month to cope with the long run trend. 
+
+###Parameters in summary:
+
+* Fee: the lower the better
+
+* Additional profit: mean weight = 0.004, the higher the higher mark-up each trade, less volume, we should put more/less weight depend on the correctness of lead-lag relationship 
+
+* Profit margin: the higher the higher mark-up each trade, but less volume
+
+* Taget lb: 0.5
+
+* Taget gb (crypto): 0.45, the higher the risky, but also lose the opportunity to win
+
+* Required lb profit: 0.005, the higher the higher mark-up each trade, less volume, more weight on BAS strategy
+
+* Required gb profit: 0.02, the higher the higher mark-up each trade, less volume, make overall trader less risky
+
+* StepSize = minumum allowed unit in exchanges
+
+* Approximate price = 520, the higher the less crypto balance ratio we will have hence the safer
+
+* TradeSize: 0.2, the higher means we put more weight (belief) on MA, as it will make crypto balance ratio change a lot. It also means more risk. For example, compared 0.01 size bid and 0.1 size bid with price = 500, the trader might want to update the price to 501 but it has already been taken by others. 
+
+
+
+# Data 
+* Balance fetcher (FB): 20 mins; fiat and eth balance for every traders
+
+* Arb fetcher (FB): every minute; MA (now, hour, 4hour, week, month)
+
+* Exchange price fetcher (Public API): every minute; bid, ask, last second transcation price and market depth for eth/fiat and btc/fiat.
+
+* Transaction fetcher (Private API): every time any trader make any transction; transaction volume, price and fee
+
+
+Notice here I merge balance, fetcher and exchange price together and call it balance data, which is recorded every 20 minutes.
+
+## Data Summary balance data
+Let's first take a closer look at the brief summary of balance data.
+```{r summary of bal, echo = FALSE}
+summary(dt)
+```
+
+
+
+
+## Data Summary transaction data
+```{r summary of transaction, echo = FALSE}
+summary(dt_trans)
+```
+
+
+
+
+# Performance
+The main way we evaluate performance of traders is using the cumulative profit over time. However, we also want to know whether our traders hit the balance targets we pre-assigned and how much volume they achieve. We are also interested in the theoretical performance (prediction power) of MA strategy. 
+
+## Profit
+The cumulative profit provides us the overall picture of trader's performance. 
+
+### Overall performance
+```{r report profit, echo = FALSE}
+cat("start date")
+total$time[1]
+cat("end date")
+total$time[length(total$cum_profit)]
+cat("cumulative profit")
+total$cum_profit[length(total$cum_profit)]
+cat("absolute profit")
+total$bal_total[length(total$cum_profit)]-total$bal_total[1]
+cat("innitial bal")
+total$bal_total[1]
+cat("final bal")
+total$bal_total[length(total$cum_profit)]
+cat("cum_profit_fiftypercent")
+(total$market_price[length(total$market_price)]-total$market_price[1])/total$market_price[1]/2
+```
+
+
+```{r report price, echo = FALSE}
+cat("innitial price")
+total$market_price[1]
+cat("end price")
+total$market_price[length(total$market_price)]
+cat("price movement percent")
+(total$market_price[length(total$market_price)]-total$market_price[1])/total$market_price[1]
+cat("Relative profit comapred to hold strategy")
+total$cum_profit[length(total$cum_profit)] - (total$market_price[length(total$market_price)]-total$market_price[1])/total$market_price[1]/2
+```
+
+Here the first basic performance statistics shows the raw cumulative profit of all traders. In Dec, our traders won 20% which is around 24k, from 106.8k to 131k. The hold-control strategy will gain 8%. The relative profit compared to the hold and control strategy is 12%
+
+
+Overall our trading system performs well compared to the overall market price. 
+
+```{r pressure, echo=FALSE}
+tp = ggplot(data = total) +
+  geom_line(aes(x=time,y=cum_profit))  +
+  geom_line(aes(x=time,y=cum_profit_fiftypercent),color = 'red')
+
+tp_filter = ggplot(data = total) +
+  geom_line(aes(x=time,y=cum_profit_filter))
+
+tp_price = ggplot(data = total) +
+  geom_line(aes(x=time,y=market_price)) 
+
+#pdf('total_profit.pdf',paper='special')
+grid.newpage()
+grid.draw(rbind(ggplotGrob(tp), ggplotGrob(tp_filter), ggplotGrob(tp_price),size = "last"))
+
+```
+
+
+From the above three graphs we could conclude:
+
+* Trader's profit is influence a lot by the price movement (BAS profit can be easily wiped out, MA profit is hard to maintain); hedge should mitigate this problem. 
+
+
+* In order to implement MA strategy completely, we should  
+
+      + Make sure the predict power is high (without any fraction, see 3.4)
+      
+      + Allieviate the fraction of implementation (decrease lb, gb required profit level)
+      
+      + Exchange has lower fee and high volume 
+      
+      + Our competitor is 'average smart', one of the drawback of this report is lack of competitor analysis -> I will spend some time look at the order book change in different exchange to see how other algo trader put orders. For example, if someone else use the same or more sophisticated auto trader than us, it is hard to make competitive order even though our prediction is correct (as our order can't be filled).
+
+### Interactive graph with varying borrowing eth
+```{r, echo=FALSE}
+ggplot(data = total) +
+  geom_line(aes(x=time,y=bal_eth)) 
+```
+
+The first graph give the actual eth balance of all traders over time. 
+```{r, echo = FALSE}
+library(shiny)
+sliderInput("eth", "Amount of borrowed eth:", min = 0, max = 70, value = 0)
+
+
+renderPlot({
+total = dt2 %>% 
+  filter(exchange == 'total') %>% 
+  mutate(tb_filter = bal_total - input$eth*market_price,
+         profit_filter = calprofit(tb_filter),
+         cum_profit_filter =cumsum(ifelse(is.na(profit_filter), 0, profit_filter)) )
+
+ggplot(data = total) +
+  geom_line(aes(x=time,y=cum_profit_filter)) 
+
+
+
+})
+```
+
+ 
+
+### Individual performance
+This part trying to answer the questions like which trader is the main driver for the overall performance and which one perform badly.
+
+1. All Traders across All time
+
+```{r, echo = FALSE}
+neworder <- c('total','bitcoincoid','quadrigacx','livecoin','hitbtc','gdax','quoinex','kucoin','lbank','exmo','gemini','quoinex_jpy','poloniex','cex','bitbay')
+dt2 <- arrange(transform(dt,
+                           exchange=factor(exchange,levels=neworder)),exchange)
+
+ggplot(data = dt2) +
+  geom_line(aes(x=time,y=cum_profit)) +
+  facet_wrap(~exchange,nrow=4,scale ='free')
+
+```
+
+2. All Traders across Selected time
+
+```{r interactive individual (only include time), echo = FALSE}
+library(shiny)
+sliderInput("start", "start date:", min = dt$time[1], max = dt$time[length(dt$time)],  value = dt$time[1])
+
+
+renderPlot({
+  dt3 = dt_row %>% 
+  filter(time > input$start) 
+  
+  dt = data.table(dt3)
+profit= dt[,calprofit(bal_total),by=exchange]
+profit = profit[,2]
+
+stdbal = dt[,bal_total,by=exchange]
+halfbaleth = stdbal$bal_total[1]/(2*dt$market_price[1])
+halfbalfiat = stdbal$bal_total[1]/2
+stdbal$bal_total= dt$market_price
+
+
+dtprofit = data.table(stdbal)
+profitbal = stdbal[,calprofit(bal_total),by=exchange]
+
+profitbal = 1/2*profitbal[,2]
+
+dt = cbind(dt,profit,profitbal)
+colnames(dt)[17] <- "profit"
+colnames(dt)[18] <- "profit_fiftypercent"
+
+cum_profit = dt[,cumsum(ifelse(is.na(profit), 0, profit)),by = exchange]
+cum_profit = cum_profit[,2]
+dt = cbind(dt,cum_profit)
+colnames(dt)[19] <- "cum_profit"
+
+cum_profit_fiftypercent = dt[,cumsum(ifelse(is.na(profit_fiftypercent), 0, profit_fiftypercent)),by = exchange]
+cum_profit_fiftypercent = cum_profit_fiftypercent[,2]
+dt = cbind(dt,cum_profit_fiftypercent)
+colnames(dt)[20] <- "cum_profit_fiftypercent"
+
+dt$first_element_of_ex = ave(dt$market_price, dt$exchange, FUN = function(x) x[1])
+
+  ggplot(data = dt) +
+    geom_line(aes(x=time,y=cum_profit)) +
+    geom_line(aes(x=time,y=0.5*(-1+market_price/first_element_of_ex)),color = 'red') +
+    facet_wrap(~exchange,nrow=4,scale ='free')
+  
+  
+})
+```
+
+
+
+ 
+ 
+
+ 
+ 
+  3. Selected Traders across Selected time with Comparison
+
+```{r interactive individual performance, echo = FALSE}
+library(shiny)
+sliderInput("start2", "start date:", min = dt$time[1], max = dt$time[length(dt$time)],  value = dt$time[1])
+
+selectInput("exchanges", "Select the exchanges", c('total','bitcoincoid','quadrigacx','livecoin','hitbtc','gdax','quoinex','kucoin','lbank','exmo','gemini','quoinex_jpy','poloniex','cex','bitbay'), selected = "bitcoincoid",multiple = TRUE)
+      
+
+renderPlot({
+  dt3 = dt_row %>% 
+  filter(time > input$start2) %>% 
+  filter(exchange == input$exchanges)
+  
+  dt = data.table(dt3)
+profit= dt[,calprofit(bal_total),by=exchange]
+profit = profit[,2]
+
+stdbal = dt[,bal_total,by=exchange]
+halfbaleth = stdbal$bal_total[1]/(2*dt$market_price[1])
+halfbalfiat = stdbal$bal_total[1]/2
+stdbal$bal_total= dt$market_price
+
+
+dtprofit = data.table(stdbal)
+profitbal = stdbal[,calprofit(bal_total),by=exchange]
+profitbal = profitbal[,2]/2
+
+dt = cbind(dt,profit,profitbal)
+colnames(dt)[17] <- "profit"
+colnames(dt)[18] <- "profit_fiftypercent"
+
+cum_profit = dt[,cumsum(ifelse(is.na(profit), 0, profit)),by = exchange]
+cum_profit = cum_profit[,2]
+dt = cbind(dt,cum_profit)
+colnames(dt)[19] <- "cum_profit"
+
+cum_profit_fiftypercent = dt[,cumsum(ifelse(is.na(profit_fiftypercent), 0, profit_fiftypercent)),by = exchange]
+cum_profit_fiftypercent = cum_profit_fiftypercent[,2]
+dt = cbind(dt,cum_profit_fiftypercent)
+colnames(dt)[20] <- "cum_profit_fiftypercent"
+
+dt$first_element_of_ex = ave(dt$market_price, dt$exchange, FUN = function(x) x[1])
+
+  ggplot(data = dt) +
+    geom_line(aes(x=time,y=cum_profit)) +
+    geom_line(aes(x=time,y=0.5*(-1+market_price/first_element_of_ex)),color = 'red') +
+    facet_wrap(~exchange,nrow=4,scale ='free')
+
+
+
+})
+```
+
+Strategy adjustment in June:
+
+* 1. Moving from maMidArb[‘1D’] to maMidArb[‘1h’] for all my alt and fiat traders
+
+* 2. adding quoinex, quoinex_jpy, cex, poloniex, bleutrade, hitbtc and quit wex this month
+
+
+Strategy adjustment on August 12:
+
+* 1. Update trade more frequently (previously only update 3 times per 10 mins)
+
+* 2. Kucoin transaction fee from 0.15% to 0.06%
+ 
+Strategy adjustment in August 20:
+
+* 1. withhold 8000cad in Quadrigacx (around 40% bal)
+Notice there are some inter-exchange money movement which lead to discontinuities.
+
+Strategy adjustment in Sep:
+
+* 1. Cancel withhold 8000cad in Quadrigacx (around 40% bal)
+
+* 2. Hitbtc margin profit required change from 0.0005 -> 0.001
+
+Strategy adjustment in Nov:
+
+* indodax(fiat & alt): reduce transaction size from 0.2 to 0.12; get rid of the additional profit (long run week and hourly arb)
+
+
+Asset movement on Nov 1
+
+* Move Indodax (24) to quoinex_jpy
+* Move Kucoin (10) to cex 
+* Move livecoin (10) to quadrigacx
+
+On Nov 11
+
+*  Move 1eth from Quoinex JPY -> bitbay
+
+On Dec 2
+
+*  Move 15eth from Indodax -> bitbay
+
+We could conclude that:
+
+* Performance order (June): livecoin (-1%) > bitcoincoid (-7.5%) > quadrigacx (-10%) > gdax (-10%) > wex (-12%) > Kucoin (-18%) > Lbank (-23%)
+
+* Adjusted withdraw Performance order (July):  bitcoincoid (5%) > gdax (5%) > quadrigacx (4%)  > Kucoin (3%) > livecoin (2%) > Lbank (-5%)
+
+* Adjusted withdraw Performance order (August):  quoinex > quoinex_jpy > cex > kucoin > poloniex > livecoin > bleutrade > hitbtc > gdax > lbank > quadrigacx > bitcoincoid
+
+* Adjusted withdraw Performance order (Sep):  quoinex_jpy > quoinex > cex > exmo > quadrigacx >  gdax > bitcoincoid  > poloniex > hitbtc >  lbank > kucoin
+
+* Adjusted withdraw Performance order (Oct):  cex > quoinex_jpy > quadrigacx > quoinex >  exmo >   gdax   > poloniex >  kucoin > livecoin > bitcoincoid
+
+* Adjusted withdraw Performance order (Nov):  bitbay(20%) > poloniex (-4%) > livecoin (-4.17%) > exmo (-5%) > quoinex (-8%) > quoinex_jpy (-8.1%) > cex(-9%) > kucoin (-9.4%) > quadrigacx (-17%) > bitcoincoid (-20%) > gdax (-35%) (after add 3.2k it will be -25%)
+
+* Adjusted withdraw Performance order (Dec):  bitbay(45%) > quoinex_jpy (43%) > exmo (40%) > quadrigacx (37%) > poloniex (32%) > cex (30%) > livecoin (27%) > Gdax (26%) > kucoin (25%) > Bitcoincoid (21%) > Hegde account 
+
+
+## Volatility
+This part is trying to capture the volatility of our trader's performance measured by the variance of the daily return.
+
+```{r, echo = FALSE}
+neworder <- c('total','bitcoincoid','quadrigacx','livecoin','hitbtc','gdax','quoinex','kucoin','lbank','exmo','quoinex_jpy','poloniex','cex','bitbay')
+dt2 <- arrange(transform(dt,
+                           exchange=factor(exchange,levels=neworder)),exchange)
+
+mean_profit = aggregate(dt2$profit, by=list(dt2$exchange), FUN=mean,na.rm = T)
+sd_profit = aggregate(dt2$profit, by=list(dt2$exchange), FUN=sd,na.rm = T)
+sharp_ratio = mean_profit$x/sd_profit$x
+# exchange_name = c('bitcoincoid','quadrigacx','livecoin','bitbay','wex')
+volatility = cbind(mean_profit,sd_profit$x,sharp_ratio)
+
+ggplot(data = volatility) +
+  geom_col(aes(x=reorder(Group.1, sd_profit$x),y=sd_profit$x)) +
+  ylab ( 'standard deviation') +
+  xlab ('exchange') 
+
+ggplot(data = volatility) +
+  geom_col(aes(x=reorder(Group.1, -sharp_ratio),y=sharp_ratio)) +
+  ylab ( 'sharp ratio') +
+  xlab ('exchange') 
+
+
+```
+
+## Balance
+
+* The target global balance (gb) is 0.45
+
+* The target local balance (lb) is 0.5
+
+* The more the balance is deviate from the target balance, the more it should generate profit from predicted MA (the reason for the gap b/w target and actual lb is that MA difference is greater)
+
+* The less the balance deviates from the target balance (it is still changing), the more it should generate profit from BAS
+
+```{r, echo = FALSE}
+ggplot(data = dt2) +
+  geom_boxplot(aes(x=time,y=bal_fiat/bal_total,group = 1)) +
+  facet_wrap(~exchange,nrow=3)
+
+ggplot(data = dt2) +
+  geom_line(aes(x=time,y=bal_fiat/bal_total)) +
+  facet_wrap(~exchange,nrow=3)
+
+
+
+```
+
+Gdax this month is unusually volatile. 
+
+
+The first graph shows how the balance change across time for each exchange, the second shows the boxplot which give the mean(the middle bold line), 0.25 and 0.75 quatlie and maximum and minimum of each exchange balance.
+
+* The gb bounces around 0.5 which is expected. It is a little bit over 0.5, which is good as the price dropped in June. Overall gb is quite health, it means most of the time bid ask spread(BAS) is the main motivation of the trade, however, MA also plays important role when necessary.  This is desired as we expect that BAS could make profit when the market is stable and MA save as from market crash and help us ride the market rocket. 
+
+* Desired lb: Even though target lb = 0.5, we expect a lower than 0.5 fiat ratio on average over time as the market is increasing overall (A correct MA strategy will lead to a lower lb in the given periods); the wider the box, the more MA strategy determine the trade direction, however we do not know if the MA prediction is good or not
+
+
+
+
+
+
+
+## Volume
+In theory, we want to trade as many as possible when MA and BAS are the same.
+
+```{r, echo = FALSE, warning = FALSE}
+dt_trans$vol = as.numeric(dt_trans$vol)
+
+dt_trans$vol[is.na(dt_trans$vol)] <- 0
+dt = ddply(dt_trans,~date,summarise,sum=sum(vol))
+ggplot(data = dt)+
+  geom_line(aes(x = date, y = sum)) +
+  ylab('eth volume') 
+```
+
+
+Transaction volume almost triples this month compared to last month. The main driver is still gdax. 
+
+```{r, echo = FALSE}
+dt_trans %>% 
+  dplyr::group_by(exchange,date) %>% 
+  dplyr::summarise(vol_date = sum(vol)) %>% 
+  ggplot()+
+  geom_line(aes(x=date,y=vol_date))+
+  facet_wrap(~exchange,nrow=3)
+  
+```
+
+
+## Predict Power
+This section use the MA data to simulate traders' performance in an 'idea situation'. 
+
+The best prediction in Dec is still quadrigacx. Bitbay and quoinex_jpy are doing good as usual.
+
+### Current CP with threshold = 0 
+```{r, echo = FALSE}
+predict = dt2 %>% 
+  #filter(exchange == c('bitcoincoid','bitbay','kraken','gdax','independentreserve','quadrigacx','huobipro','livecoin')) %>% 
+mutate(
+  di_arb_nowday = arb_day - arb_now, # positive buy
+  di_arb_nowhour = arb_hour - arb_now,
+  mid = (market_bid + market_ask)/2,
+  profit_index_mid = ifelse((di_arb_nowhour>0 & Lag(mid,-1)-mid>=0)|(di_arb_nowhour<0 & Lag(mid,-1)-mid<=0),1,0),
+  profit_index_mid_bid = ifelse((di_arb_nowhour>0 & Lag(mid,-1)-mid>0)|(di_arb_nowhour<0 & Lag(mid,-1)-mid<=0),1,0),
+  profit_index_mid_ask = ifelse((di_arb_nowhour>0 & Lag(mid,-1)-mid>=0)|(di_arb_nowhour<0 & Lag(mid,-1)-mid<0),1,0),
+  profit_index_mid_bas = ifelse((di_arb_nowhour>0 & Lag(mid,-1)-mid>0)|(di_arb_nowhour<0 & Lag(mid,-1)-mid<0),1,0),
+  profit_index = ifelse((di_arb_nowhour>0 & Lag(market_price,-1)-market_price>=0)|(di_arb_nowhour<0 & Lag(market_price,-1)-market_price<=0),1,0),
+  price_mid_change = Lag(mid,-1)-mid
+) 
+
+predict_power = aggregate(predict$profit_index, by=list(exchange=predict$exchange), FUN=mean,na.rm=TRUE)
+
+trade_thres = 0.0000
+predict2 = predict %>% 
+  filter(di_arb_nowhour>(trade_thres)|di_arb_nowhour<(-trade_thres)) %>% 
+  mutate(
+    profit_index_threshold = ifelse((di_arb_nowhour>trade_thres & Lag(market_price,-1)-market_price>=0)|(di_arb_nowhour<(-trade_thres) & Lag(market_price,-1)-market_price<=0),1,0)
+  )
+predict_power2 = aggregate(predict2$profit_index_threshold, by=list(exchange=predict2$exchange), FUN=mean,na.rm=TRUE)
+
+ggplot(data = predict_power2) +
+  geom_col(aes(x=reorder(exchange, -x),y=x)) +
+  ylab ( 'correct rate using threshold =0') +
+  xlab ('exchange') +
+  geom_text(aes(x=reorder(exchange, -x),y=x,label = round(x,3)))
+
+```
+
+The correct porion (CP) measures the proportion of how many time MA correctly predict next 20 mins price direction. For example, if at 00:00, MA now - MA daily = 0.000000001, MA predicts the price will decrease, if 00:20 the price decreases, then MA corrects. In the next part, we set threshold = 0.0001, which means, only when |MA now - MA daily| > 0.0001 the trader trades, in other words, if MA now - MA daily = 0.000000001, the trader doesn't trade. This can avoid ambiguous MA signal, which is particularly crucial in 'dramatically change' market situations. For example, the market price is going to decrease very fast, some of the algo traders may realize the smell of crash but ours not, even though our MA is negative, but it is not negative enough, so the market keep filling our bid but not ask. We could implement by change the "maMidArb" as a piecewise function in cal.js.
+
+
+
+
+
+### Current CP with threshold = 0.0001
+```{r, echo = FALSE}
+trade_thres = 0.0001
+predict2 = predict %>% 
+  filter(di_arb_nowhour>(trade_thres)|di_arb_nowhour<(-trade_thres)) %>% 
+  mutate(
+    profit_index_threshold = ifelse((di_arb_nowhour>trade_thres & Lag(market_price,-1)-market_price>=0)|(di_arb_nowhour<(-trade_thres) & Lag(market_price,-1)-market_price<=0),1,0)
+  )
+predict_power2 = aggregate(predict2$profit_index_threshold, by=list(exchange=predict2$exchange), FUN=mean,na.rm=TRUE)
+
+ggplot(data = predict_power2) +
+  geom_col(aes(x=reorder(exchange, -x),y=x)) +
+  ylab ( 'correct rate using threshold =0.001') +
+  xlab ('exchange') +
+  geom_text(aes(x=reorder(exchange, -x),y=x,label = round(x,3)))
+
+```
+
+### Current CP with threshold = 0.0005
+```{r, echo = FALSE}
+trade_thres = 0.0005
+predict2 = predict %>% 
+  filter(di_arb_nowhour>(trade_thres)|di_arb_nowhour<(-trade_thres)) %>% 
+  mutate(
+    profit_index_threshold = ifelse((di_arb_nowhour>trade_thres & Lag(market_price,-1)-market_price>=0)|(di_arb_nowhour<(-trade_thres) & Lag(market_price,-1)-market_price<=0),1,0)
+  )
+predict_power2 = aggregate(predict2$profit_index_threshold, by=list(exchange=predict2$exchange), FUN=mean,na.rm=TRUE)
+
+ggplot(data = predict_power2) +
+  geom_col(aes(x=reorder(exchange, -x),y=x)) +
+  ylab ( 'correct rate using threshold =0.005') +
+  xlab ('exchange') +
+  geom_text(aes(x=reorder(exchange, -x),y=x,label = round(x,3)))
+
+```
+
+
+Unfortunately it is hard to see significant increase of the CP when adjusting the threshold, I have created an interactive interface to fine-tune the threshold to find the highest CP for each exchange, we could further incorporate this parameters to cal.js.
+
+Based on the CP, the performance rank is: 
+
+* quadrigacx > bitbay > bitcoincoid > livecoin > quoinex > quoinex_jpy   > cex > poloniex > exmo > gdax  > kucoin
+
+
+### Interactive threshold
+```{r, echo = FALSE}
+
+sliderInput("threshold", "threshold:", min = 0, max = 0.01, value = 0)
+predict = dt2 %>% 
+  #filter(exchange == c('bitcoincoid','bitbay','kraken','gdax','independentreserve','quadrigacx','huobipro','livecoin')) %>% 
+mutate(
+  di_arb_nowhour = arb_day - arb_now, # positive buy
+  di_arb_nowhour = arb_hour - arb_now,
+  mid = (market_bid + market_ask)/2,
+  profit_index_mid = ifelse((di_arb_nowhour>0 & Lag(mid,-1)-mid>=0)|(di_arb_nowhour<0 & Lag(mid,-1)-mid<=0),1,0),
+  profit_index_mid_bid = ifelse((di_arb_nowhour>0 & Lag(mid,-1)-mid>0)|(di_arb_nowhour<0 & Lag(mid,-1)-mid<=0),1,0),
+  profit_index_mid_ask = ifelse((di_arb_nowhour>0 & Lag(mid,-1)-mid>=0)|(di_arb_nowhour<0 & Lag(mid,-1)-mid<0),1,0),
+  profit_index_mid_bas = ifelse((di_arb_nowhour>0 & Lag(mid,-1)-mid>0)|(di_arb_nowhour<0 & Lag(mid,-1)-mid<0),1,0),
+  profit_index = ifelse((di_arb_nowhour>0 & Lag(market_price,-1)-market_price>=0)|(di_arb_nowhour<0 & Lag(market_price,-1)-market_price<=0),1,0),
+  price_mid_change = Lag(mid,-1)-mid
+) 
+
+predict_power = aggregate(predict$profit_index, by=list(exchange=predict$exchange), FUN=mean,na.rm=TRUE)
+
+trade_thres = 0.0000
+predict2 = predict %>% 
+  filter(di_arb_nowhour>(trade_thres)|di_arb_nowhour<(-trade_thres)) %>% 
+  mutate(
+    profit_index_threshold = ifelse((di_arb_nowhour>trade_thres & Lag(market_price,-1)-market_price>=0)|(di_arb_nowhour<(-trade_thres) & Lag(market_price,-1)-market_price<=0),1,0)
+  )
+predict_power2 = aggregate(predict2$profit_index_threshold, by=list(exchange=predict2$exchange), FUN=mean,na.rm=TRUE)
+
+
+
+renderPlot({
+  predict2 = predict %>% 
+  filter(di_arb_nowhour>(input$threshold)|di_arb_nowhour<(-input$threshold)) %>% 
+  mutate(
+    profit_index_threshold = ifelse((di_arb_nowhour>input$threshold & Lag(market_price,-1)-market_price>=0)|(di_arb_nowhour<(-input$threshold) & Lag(market_price,-1)-market_price<=0),1,0)
+  )
+predict_power2 = aggregate(predict2$profit_index_threshold, by=list(exchange=predict2$exchange), FUN=mean,na.rm=TRUE)
+
+ggplot(data = predict_power2) +
+  geom_col(aes(x=reorder(exchange, -x),y=x)) +
+  ylab ( 'correct rate using threshold =0') +
+  xlab ('exchange') +
+  geom_text(aes(x=reorder(exchange, -x),y=x,label = round(x,3)))
+})
+```
+
+
+
+# Traders Characteristics
+
+This section summarize the specific characteristics for traders.
+
+## arb 
+
+```{r, echo = FALSE, warning = FALSE}
+
+
+
+##  arb now - hour: positive -> sell
+ggplot(data = dt2) +
+  geom_boxplot(aes(x=time,y=dif_nh,group = 1)) +
+  facet_wrap(~exchange,nrow=4)
+
+ggplot(data = dt2) +
+  geom_line(aes(x=time,y=dif_nh,group = 1)) +
+  facet_wrap(~exchange,nrow=4)
+
+## arb day - month: positive -> sell 
+ggplot(data = dt2) +
+  geom_boxplot(aes(x=time,y=dif_hw,group = 1)) +
+  facet_wrap(~exchange,nrow=4)
+
+ggplot(data = dt2) +
+  geom_line(aes(x=time,y=dif_hw,group = 1)) +
+  facet_wrap(~exchange,nrow=4)
+
+##  arb now - day: positive -> sell
+ggplot(data = dt2) +
+  geom_boxplot(aes(x=time,y=dif_nd,group = 1)) +
+  facet_wrap(~exchange,nrow=4)
+
+ggplot(data = dt2) +
+  geom_line(aes(x=time,y=dif_nd,group = 1)) +
+  facet_wrap(~exchange,nrow=4)
+
+```
+
+
+
+The first graph shows the boxplot for difference between arb now - day, the second is the difference b/w arb day - month. All of them look good (mean = 0) but the spreads are various across different exchanges. Vertically comparing the first two graphs we found the second graph (livecoin, bitcoincoid, quadrigacx and wex) wants us to sell more ETH, which is exactly what the June market says. Remember that in last month the scale of now-day is much larger than the scale of day-month. However this month there are pretty similar, which means the "addition profit" parameter is getting more prediction power. Based on the fact that the the diff_dm successfully predict the price increasing, we may want to put more weight on this parameter? By increasing the weight on the additional profit in cal.js.
+
+### arb interactive graph
+
+```{r interactive individual performance arb, echo = FALSE}
+library(shiny)
+sliderInput("start3", "start date:", min = dt2$time[1], max = dt2$time[length(dt2$time)],  value = dt2$time[1])
+
+selectInput("exchanges2", "Select the exchanges", c('bitcoincoid','quadrigacx','livecoin','hitbtc','gdax','quoinex','kucoin','lbank','exmo','gemini','quoinex_jpy','poloniex','cex','bitbay'), selected = "quoinex",multiple = TRUE)
+      
+
+renderPlot({
+  dt5 = dt2 %>% 
+  filter(time > input$start3) %>% 
+  filter(exchange == input$exchanges2)
+  
+
+ggplot(data = dt5) +
+  geom_line(aes(x=time,y=dif_nh,group = 1)) +
+  facet_wrap(~exchange,nrow=4)
+
+
+
+
+})
+```
+
+
+
+
+
+## Volume
+### Total Volume
+```{r, echo = FALSE}
+
+
+ggplot(data = global_vol)  +
+  geom_bar(mapping = aes(x = reorder(name, volume), y=volume),stat = "identity") +
+  xlab("exchange") +
+  ylab('daily average eth volume') +
+  geom_text(aes(x=reorder(name, volume),y=volume,label = round(volume,3)))
+
+dt_bal_percent = dt2 %>% 
+  filter(time == total$time[length(quoinex_total$time)])
+
+dt_bal_percent$market_price[which(dt_bal_percent$exchange == 'quoinex_jpy')]= dt_bal_percent$market_price[which(dt_bal_percent$exchange == 'quoinex_jpy')]*110
+  
+dt_bal_percent = dt_bal_percent %>% 
+  mutate(bal_total_eth = bal_total/market_price) %>% 
+  mutate(bal_per = bal_total_eth/bal_total_eth[which(dt_bal_percent$exchange == 'total')])
+
+colnames(global_vol)[1] = 'exchange'
+global_vol_m = merge(global_vol,dt_bal_percent, by= 'exchange')
+
+ggplot(data = global_vol_m)  +
+  geom_bar(mapping = aes(x = reorder(exchange, bal_per), y=bal_per),stat = "identity") +
+  xlab("exchange") +
+  ylab('percent balance of total') +
+  geom_text(aes(x = reorder(exchange, bal_per), y=bal_per,label = round(bal_per,3)))
+
+
+ggplot(data = global_vol_m)  +
+  geom_bar(mapping = aes(x = reorder(exchange, volume/bal_per), y=volume/bal_per),stat = "identity") +
+  xlab("exchange") +
+  ylab('daily average eth volume adjusted for balance') +
+  geom_text(aes(x=reorder(exchange, volume/bal_per),y=volume/bal_per,label = round(volume/bal_per,3)))
+
+
+```
+
+### Volume in Days
+```{r, echo = FALSE}
+dt_trans %>% 
+  dplyr::group_by(exchange,date) %>% 
+  dplyr::summarise(vol_date = sum(vol)) %>% 
+  ggplot()+
+  geom_line(aes(x=date,y=vol_date))+
+  facet_wrap(~exchange,nrow=3)
+  
+```
+
+### Volume in Days exclude Gdax
+```{r, echo = FALSE}
+dt_trans %>% 
+  filter(exchange != 'gdax') %>% 
+  dplyr::group_by(exchange,date) %>% 
+  dplyr::summarise(vol_date = sum(vol)) %>% 
+  ggplot()+
+  geom_line(aes(x=date,y=vol_date))+
+  facet_wrap(~exchange,nrow=3)
+  
+```
+
+### Type of transaction in Days exclude Gdax
+```{r, echo = FALSE}
+dt_trans$type = tolower(dt_trans$type)
+dt_trans$type = as.factor(dt_trans$type)
+
+dt_trans$vol = ifelse(dt_trans$type=='sell',-dt_trans$vol,dt_trans$vol)
+dt_trans %>% 
+  filter(exchange != 'gdax') %>% 
+  dplyr::group_by(exchange,date) %>% 
+  dplyr::summarise(vol_date = sum(vol)) %>% 
+  ggplot()+
+  geom_line(aes(x=date,y=vol_date))+
+  facet_wrap(~exchange,nrow=3)
+  
+```
+
+### Type of transaction continuously exclude Gdax
+```{r, echo = FALSE}
+
+dt_trans %>% 
+  filter(exchange != 'gdax') %>% 
+  dplyr::group_by(exchange) %>% 
+
+  ggplot()+
+  geom_line(aes(x=time,y=vol))+
+  facet_wrap(~exchange,nrow=3)
+  
+```
+
+### Type of transaction continuously exclude Gdax with selected time
+
+```{r interactive individual volume, echo = FALSE}
+ library(shiny)
+ gdax_data = dt_trans[which(dt_trans$exchange == 'gdax'),]
+rows = nrow(gdax_data)
+sliderInput("start5", "start time:", min = dt_trans$time[1], max = dt_trans$time[rows],  value = dt_trans$time[1])
+sliderInput("end5", "end time:", min = dt_trans$time[1], max = dt_trans$time[rows],  value = dt_trans$time[rows])
+
+selectInput("exchanges5", "Select the exchanges", c('bitcoincoid','quadrigacx','livecoin','gdax','quoinex','kucoin','exmo','gemini','quoinex_jpy','poloniex','cex'), selected = "quoinex",multiple = TRUE)
+      
+
+renderPlot({
+
+
+dt_trans %>% 
+  dplyr::group_by(exchange) %>% 
+  filter(time > input$start5) %>% 
+    filter(time < input$end5) %>% 
+  filter(exchange == input$exchanges5)  %>%
+  
+
+  ggplot()+
+  geom_line(aes(x=time,y=vol))+
+  facet_wrap(~exchange,nrow=3)
+
+})
+
+renderPlot({
+
+
+dt_trans %>% 
+  dplyr::group_by(exchange) %>% 
+  filter(time > input$start5) %>% 
+    filter(time < input$end5) %>% 
+  filter(exchange == input$exchanges5)  %>%
+  
+  ggplot()+
+  geom_point(aes(x=time,y=vol))+
+  facet_wrap(~exchange,nrow=3)
+})
+```
+
+
+
+
+
+## Fee
+```{r, echo = FALSE}
+dt_trans %>% 
+  dplyr::group_by(exchange,date) %>% 
+  dplyr::summarise(fee_date = mean(feeper)) %>% 
+  ggplot()+
+  geom_line(aes(x=date,y=fee_date))+
+  facet_wrap(~exchange,nrow=3)
+
+```
+
+
+
+
+
+# Exchanges Characteristics
+
+## Eth Volume
+```{r,message=FALSE, error=FALSE, echo=F, warning=F}
+ggplot(data = dt2) +
+  geom_boxplot(aes(x=time,y=market_ethvol,group = 1)) +
+  facet_wrap(~exchange,nrow=3)
+
+```
+
+
+
+## Bid Ask Spread
+
+```{r,message=FALSE, error=FALSE, echo=F, warning=FALSE}
+ggplot(data = dt2) +
+  geom_boxplot(aes(x=time,y=bas,group = 1)) +
+  facet_wrap(~exchange,nrow=3)
+
+```
+
+
+BAS is calculated using ask/bid
+Livecoin has the highest BAS, means it will be profitbale in the stable market condition
+
+## Leader - follower Relationship
+
+It has been proved in March that Gdax is the market leader in eth/usd 
+
+
+# Conclusion
+
+*  In Dec, our traders won 20% which is around 22k, from 106.8k to 129k. The hold-control strategy will gain 7%. The relative profit compared to the hold and control strategy is 13.3%.  The best trader this month is bitbay (45%). Even the worst trader (bitcoincoid) earned 21% which beats the market price movement (16%). 
+
+* Profitability : 
+
+* December:  bitbay(45%) > quoinex_jpy (43%) > exmo (40%) > quadrigacx (37%) > poloniex (32%) > cex (30%) > livecoin (27%) > Gdax (26%) > kucoin (25%) > Bitcoincoid (21%) > Hegde account 
+
+    + November:  bitbay(20%) > poloniex (-4%) > livecoin (-4.17%) > exmo (-5%) > quoinex (-8%) > quoinex_jpy (-8.1%) > cex(-9%) > kucoin (-9.4%) > quadrigacx (-17%) > bitcoincoid (-20%) > gdax (-35%) (after add 3.2k it will be -25%)
+
+    + October:     cex > quoinex_jpy > quadrigacx > quoinex > exmo > gdax > poloniex > kucoin > livecoin > bitcoincoid
+    
+    + September:     quoinex_jpy > quoinex > cex > exmo > quadrigacx > gdax > bitcoincoid > poloniex > hitbtc > lbank > kucoin
+
+    + August:     quoinex > quoinex_jpy > cex > kucoin > poloniex > livecoin > bleutrade > hitbtc > gdax > lbank > quadrigacx > bitcoincoid
+
+    + July:     bitcoincoid (5%) > gdax (5%) > quadrigacx (4%) > hitbtc( 3%) > Kucoin (3%) > livecoin (2%) > Lbank (-5%)
+
+    + June:     livecoin (-1%) > bitcoincoid (-7.5%) > quadrigacx (-10%) > gdax (-10%) > wex (-12%) > Kucoin (-18%) > Lbank (-23%)
+
+    + May:        bitcoincoid > quadrigacx > livecoin > bitbay > gdax > wex > Kucoin > bitstamp
+
+    + April:      bitcoincoid > quadrigacx > livecoin > bitbay > gdax
+
+    + March:      bitcoincoid > quadrigacx > livecoin > bitbay 
+    
+
+
+* Balance proportion:
+     
+      + December:  quoinex_jpy(21) > gdax(19) > bitcoincoid(17) > quadrigacx (15) > livecoin (5) > cex(3) > exmo (2.6) > bitbay (2.5) > kucoin (0.9) > poloniex (0.6)
+      
+      + November:  gdax (18.7) > Quoinex(18.6) > bitcoincoid (18)  > Quoinex_jpy (17.28) > quadrigacx (15)   >  livecoin (6) > kucoin (4.6) > exmo (2) > cex(3) > poloniex (0.4) > bitbay (0.2)
+       
+      + October: bitcoincoid (22) > gdax (22.3) > quadrigacx (12.3)  > Quoinex_jpy (12) > Quoinex(11.5) > livecoin (6) > kucoin (4.6) > exmo (2) > cex(1.25) > poloniex (0.4)
+       
+      + September: bitcoincoid (35) > gdax (22.3) > quadrigacx (12.3) > Quoinex(11.5) > livecoin (6) >   Quoinex_jpy (6) > kucoin (4.6) 
+            
+      + August: bitcoincoid (39) > gdax (23.5) > quadrigacx (13) > livecoin (6) > Quoinex(6) >  kucoin (5) 
+      
+      + July: Not clear (the eth price doesn't change too much)
+
+      + June: bitcoincoid (39) > gdax (22.5) > quadrigacx (19.5) > livecoin (12.8) > kucoin (3.6) > wex (1)
+      
+      + May: bitcoincoid (33.17) > gdax (25.7) > quadrigacx (17.08) > livecoin (11.42) > bitbay (5.8) > kucoin (4.15) > wex (2.3) > bitstamp (0.34)
+
+
+* MA Correct rate: 
+    + prediction power: 
+    
+       + Dec:      quadrigacx > bitbay > bitcoincoid > livecoin > quoinex_jpy   > cex > poloniex > exmo > gdax >  kucoin
+         
+     + Nov:      quadrigacx > bitcoincoid > quoinex > quoinex_jpy > livecoin  > cex > poloniex > exmo > gdax > bitbay > kucoin
+         
+     + Oct:      quadrigacx > bitcoincoid > quoinex > quoinex_jpy > gdax > livecoin > cex > exmo > poloniex > kucoin
+    
+     + Sep:      bleutrade  > quadrigacx > bitcoincoid > quoinex > quoinex_jpy >livecoin > cex >  poloniex  > lbank > gdax > exmo > hitbtc > kucoin 
+        
+    + August:      bleutrade > quoinex > quoinex_jpy > quadrigacx >livecoin > bitcoincoid > cex >  poloniex  > kucoin > hitbtc > gdax > lbank
+    
+    + July:      bleutrade > quoinex_jpy > quoinex > quadrigacx >livecoin > cex > bitcoincoid > liqui > gdax > lbank > hitbtc > kucoin > poloniex
+    
+    + June:        lbank > quadrigacx > livecoin > bitcoincoid > wex > kucoin > gdax
+        
+    + May:        bitbay > bitcoincoid > quadrigacx > livecoin > bitstamp > wex > kucoin > gdax
+
+    + April:      bitbay > bitcoincoid > quadrigacx > livecoin > gdax > wex
+
+    + March:      bitcoincoid >  bitbay > livecoin > quadrigacx > huobipro 
+      
+
+     
+      
+* Volatility (from lowest to highest):
+
+    + Dec:        gdax > cex > bitcoincoid > bitbay > quoinex_jpy > quadrigacx > livecoin > exmo > poloniex > kucoin
+    
+    + Nov:        exmo > kucoin > quoinex_jpy > cex > bitcoincoid  > gdax > livecoin > quadrigacx > quoinex > poloniex
+    
+    + Oct:        exmo > cex > gdax > livecoin > quadrigacx > bitcoincoid > poloniex > kucoin > quoinex_jpy > quoinex
+    
+    + Sep:        poloniex > quoinex_jpy > gdax > exmo > hitbtc > kucoin > bitcoincoid > bleutrade > quadrigacx > livecoin > cex > lbank > quoinex (due to transfer money)
+    
+    + August:        lbank > quoinex > quoinex_jpy > kucoin > livecoin > quadrigacx > poloniex 
+    
+    + July:        Liqui > poloniex > kucoin > livecoin > quoinex_jpy >bitcoincoid > quadrigacx > quoinex > lbank > hitbtc > gdax > cex  > bleutrade
+    
+    + June:        Wex > quadrigacx > gdax > lbank  > bitcoincoid  > kucoin > livecoin
+
+    + May:        Wex > livecoin > bitbay > gdax > quadrigacx > kucoin > bitcoincoid > bitstamp 
+
+    + April:     Wex > quadrigacx > bitcoincoid >livecoin > bitbay > gdax 
+
+
+
+
+* Sharp Ratio:
+
+    + Dec: bitbay > quoinex_jpy > cex > gdax > quadrigacx > exmo > bitcoincoid > poloniex > livecoin > kucoin
+    
+    + Nov: bitbay > poloniex > livecoin > quoinex > exmo > quoinex_jpy > cex > kucoin > quadrigacx > bitcoincoid > gdax
+    
+    + Oct: quoinex_jpy > cex > quadrigacx > quoinex > poloniex > gdax > exmo > livecoin > kucoin > bitcoincoid
+    
+    + Sep: Exmo > quoinex_jpy > gdax > cex > quoinex > bitcoincoid > quadrigacx > poloniex
+    
+    + April: Bitbay > livecoin > bitcoincoid > quadrigacx > gdax > wex
+    
+    
+    
+  
+* Balance Health (should be 50% fiat) :
+
+    + December: bitcoincoid > gdax > quadrigacx > quoinex_jpy > cex > bitbay > livecoin coid > kucoin > exmo > poloniex 
+    
+    + November: gdax (extreme propotion) > quoinex> quoinex_jpy > bitcoincoid (extreme propotion) > cex > kucoin > poloniex  > quadrigacx (extreme propotion) > livecoin > exmo 
+    
+    + October: gdax > quoinex > quadrigacx > quoinex_jpy > cex > kucoin > poloniex livecoin > exmo > bitcoincoid
+    
+    + September: bleutrade > gdax > poloniex > kucoin > quadrigacx > quoinex_jpy > cex > quoinex > hitbtc > lbank > exmo > bitcoincoid
+    
+    + August: livecoin > quadrigacx > cex > quoniex > gdax > bitcoincoid > kucoin > lbank > bleutrade > hitbtc 
+
+    + July: Not clear (the eth price doesn't change too much)
+
+    + June:      bitcoincoid > Livecoin  > lbank > gdax > quadrigacx > wex > kucoin
+
+    + May:      Livecoin > bitcoincoid > wex > quadrigacx > gdax > kucoin > bitbay 
+
+    + April:    quadrigacx > bitbay > bitcoincoid > livecoin > wex > gdax
+
+ 
+    
+
+
+
+
+* MA fraction 
+
+    + Dec: Fee: Bitbay > quadrigacx > exmo > poloniex > livecoin > kucoin > bitcoincoid  >  Gdax = quoinex = cex 
+    + Dec: Volume: gdax > cex > quoinex  > quoinex_jpy > quadrigacx > poloniex > livecoin > bitcoincoid > kucoin > exmo 
+    
+    + Nov: Fee: Bitbay > quadrigacx > exmo > poloniex > livecoin > kucoin > bitcoincoid  >  Gdax = quoinex = cex 
+    + Nov: Volume: gdax > cex > quoinex  > quoinex_jpy > quadrigacx > poloniex > livecoin > bitcoincoid > kucoin > exmo 
+    
+    + Oct: Fee: quadrigacx > exmo > poloniex > livecoin > kucoin > bitcoincoid  >  Gdax = quoinex = cex 
+    + Oct: Volume: Gdax  > kucoin > quadrigacx > quoinex > cex > quoinex_jpy > bitcoincoid > poloniex > livecoin  > exmo  
+    
+    + Sep: Fee: quadrigacx > exmo > poloniex > livecoin > kucoin > bitcoincoid  >  Gdax = quoinex
+    + Sep: Volume: Gdax > quadrigacx > quoinex > quoinex_jpy > bitcoincoid  > kucoin > livecoin > poloniex > cex > exmo 
+    
+    + July: Fee: quadrigacx > livecoin > kucoin > bitcoincoid  >  Gdax
+    + July: Volume: Gdax > quadrigacx > bitcoincoid  > kucoin > livecoin 
+    
+    + June: Fee: quadrigacx > wex > livecoin >  Gdax > kucoin > bitcoincoid
+    + June: Volume: Gdax > quadrigacx > bitcoincoid  > kucoin > livecoin 
+    
+    + May: Fee: Bitstamp > bitbay > quadrigacx > wex > livecoin > kucoin > Gdax > bitcoincoid
+    + May: Volume: Gdax > quadrigacx > bitcoincoid  > kucoin >  bitbay > livecoin > bitstamp
+    
+    
+
+
+      
+# Profitability Goal
+
+* Current time, total Balance (TB) and current price: 
+```{r, echo=FALSE}
+total$time[nrow(total)]
+total$bal_total[nrow(total)]
+total$market_price[nrow(total)]
+```
+
+
+
+
+# Task Goal
+  + add more exchanges/pairs for eth-fiat, ltc-fiat and eth-alt 
+  + hedge the alt-fiat on quoinex
+  + CLose quoinex_aud trader
+  + Add the up and down 10% ask/bid for quoinex_usd respect to gdax_usd
+  + Move Quadrigacx (20) to bitbay
+  + Move Indodax (20) to exmo
+  + Move Indodax (20) to cex
+
+
+  
+
+  
+
+
+
+# Notes
+
+* Eth events: https://cryptocalendar.pro/events/ethereum
+
+* Bitcoin events: https://bravenewcoin.com/industry-resources/events-calendar/bitcoin-and-blockchain-events/
+
+* Eth prices: https://ethereumprice.org/ 
+

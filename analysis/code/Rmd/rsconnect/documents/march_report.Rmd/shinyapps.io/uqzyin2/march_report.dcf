@@ -1,0 +1,12 @@
+name: march_report
+title: march_report
+username:
+account: uqzyin2
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 312919
+bundleId: 1313131
+url: https://uqzyin2.shinyapps.io/march_report/
+when: 1523432000.64837
+asMultiple: FALSE
+asStatic: FALSE
