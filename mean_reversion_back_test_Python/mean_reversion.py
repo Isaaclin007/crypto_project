@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import scipy.stats as stats
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
@@ -25,7 +26,7 @@ class plotting():
         fig, ax = plt.subplots(figsize = (15, 10))
         for i in name:
             ax.plot(self.time_index, df[i], label = i)
-        #
+
         ax.xaxis.set_major_locator(months)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
         ax.set_xlim(self.start, self.end)
@@ -39,6 +40,7 @@ class plotting():
         plt.show()
 
     def plot_scatter_series(self, df, ts1, ts2):
+        fig = plt.figure(figsize = (15, 10))
         plt.xlabel("%s price ($)" % ts1)
         plt.ylabel("%s price ($)" % ts2)
         plt.title("%s and %s Price Scatter Plot" % (ts1, ts2))
@@ -47,7 +49,7 @@ class plotting():
 
     def plot_spread(self, df):
         months = mdates.MonthLocator() # Every Month
-        fig, ax = plt.subplots()
+        fig, ax = plt.subplots(figsize = (15, 10))
         ax.plot(self.time_index, df, label = "spread")
         ax.xaxis.set_major_locator(months)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
@@ -62,6 +64,10 @@ class plotting():
 
         plt.show()
 
+    def spread_qq_plot(self, df):
+        fig = sm.qqplot(df, stats.t, distargs = (10, ), loc = 0, scale = 1)
+        plt.show()
+
     def plot_VR(self, data):
         plt.plot(data)
         plt.xlabel("Time Lag")
@@ -69,7 +75,7 @@ class plotting():
         plt.show()
 
     def plotting_z_score(self, z):
-        plt.figure(figsize = (15, 15))
+        plt.figure(figsize = (15, 10))
         plt.plot(z)
         plt.axhline(0, color='black')
         plt.axhline(1.0, color='red', linestyle='--')
@@ -84,15 +90,12 @@ class plotting():
         z = df["z_score"]
         s1 = df.iloc[:, 0]
         s2 = df.iloc[:, 1]
-
         # Initialling a new series data to show signal
         buy = spread.copy()
         sell = spread.copy()
-
         # Deleting the date on which z-score deviate from one std
         buy[z < -1] = np.nan
         sell[z > 1] = np.nan
-
         # The remaining index is the date we can trade #
         fig_1 = plt.figure(figsize = (15, 10))
         plt.plot(spread, linewidth = 1)
@@ -100,7 +103,6 @@ class plotting():
         plt.legend(["AAPL_HPQ"])
         plt.scatter(buy.index, buy, color = "g", marker = "^", s = 20)
         plt.scatter(sell.index, sell, color = "r", marker = "^", s = 20)
-
         x1, x2, y1, y2 = plt.axis()
         # plt.axis((x1,x2, spread_1.min(),spread_1.max()))
         plt.xlabel("Time")
@@ -171,37 +173,28 @@ class params():
         self.VR = None
         self.half_life = None
 
-        """Rolling window for recent mean"""
-        self.window_1 = None
-        """Rolling window for lookback period"""
-        self.window_2 = None
-
-        """Entry z-score only one value, + for short and - for long"""
-        self.entry_z = None
-        """Exit z-score to clear position """
-        self.exit_z = None
-
-        """Initial fund for trading """
-        self.init_f = None
-        """Unit amount for trading - Scalling factor"""
-        self.unit_amount = None
+    def getattr(self):
+        return self.pair_name, self.start_time, self.end_time, self.ols_res, self.j_res, self.ols_spread, self.j_spread, self.cadf_res, self.Hurst, self.VR, self.half_life
 
 class Testing():
-    def __init__(self, data):
+    def __init__(self, data, name_lyst):
         self.data = data
+        self.name_lyst = name_lyst
 
     def OLS_spread(self):
-        OLS = sm.OLS(self.data["y"], self.data["x"])
+        x = self.data[self.name_lyst[0]]
+        y = self.data[self.name_lyst[1]]
+        OLS = sm.OLS(y, x)
         results = OLS.fit()
-        ols_spread = self.data["y"] - results.params[0] * self.data["x"]
+        ols_spread = y - results.params[0] * x
         return results, ols_spread.values
 
-    def Johansen(self, name_lyst, p, verbose):
+    def Johansen(self, p, verbose):
         """
             Get the cointegration vectors at 95% level of significance
             given by the trace statistic test.
         """
-        y = self.data[name_lyst]
+        y = self.data[self.name_lyst]
         N, l = y.shape
         jres = coint_johansen(y, 0, p)
 
@@ -273,10 +266,11 @@ class Testing():
 
     def half_life(self, data):
         """We can calculate this by running a linear regression
-        between the spread series and a lagged version of itself.
-        The Beta coefficient produced by this regression
-        can then be incorporated into the
-        Ornstein-Uhlenbeck process to calculate the half-life."""
+           between the spread series and a lagged version of itself.
+           The Beta coefficient produced by this regression
+           can then be incorporated into the
+           Ornstein-Uhlenbeck process to calculate the half-life.
+        """
 
         # Requires data of res OR spread
         df = pd.Series(data)
@@ -291,29 +285,9 @@ class Testing():
         results = model.fit()
 
         # Calculating half_life
-
         half_life = -np.log(2)/results.params[0]
 
         return half_life
-
-    def dynamic_z_score(self, spread_data, window_1, window_2, verbose):
-        df = pd.Series(spread_data)
-        mean_1 = df.rolling(window = window_1, center = False).mean()
-        mean_2 = df.rolling(window = window_2, center = False).mean()
-        std = df.rolling(window = window_2, center = False).std()
-
-        if verbose == True:
-            plt.figure(figsize = (15, 10))
-            plt.plot(df.index, df)
-            plt.plot(mean_1.index, mean_1)
-            plt.plot(mean_2.index, mean_2)
-
-            plt.legend(["spread", str(window_1) + "d mean spread", str(window_2) + "d mean spread"])
-
-            plt.ylabel("spread")
-            plt.xlabel("Time")
-            plt.show()
-        return (mean_1 - mean_2)/std
 
     def get_data(self):
         return self.data
